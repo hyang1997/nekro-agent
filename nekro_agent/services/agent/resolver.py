@@ -2,7 +2,11 @@ import re
 
 from pydantic import BaseModel
 
+from nekro_agent.core import logger
 from nekro_agent.tools.at_markup import normalize_malformed_at_markup
+
+# 单独成行的代码围栏，如 ``` / ```python / ```py
+_FENCE_LINE_RE = re.compile(r"^[ \t]*```[A-Za-z0-9_+\-]*[ \t]*$")
 
 
 class ParsedCodeRunData(BaseModel):
@@ -71,12 +75,43 @@ def parse_chat_response(raw_content: str) -> ParsedCodeRunData:
         if matches_list:
             code_content = max((match.group(1).strip() for match in matches_list), key=len)
 
-    if code_content.strip().startswith("```python"):
-        code_content = code_content.strip()[len("```python") :].strip()
-    if code_content.strip().endswith("```"):
-        code_content = code_content.strip()[: -len("```")].strip()
+    code_content = strip_code_fences(code_content)
 
     return ParsedCodeRunData(raw_content=raw_content, code_content=fix_code_content(code_content), thought_chain=thought_chain)
+
+
+def strip_code_fences(code_content: str) -> str:
+    """移除残留的 Markdown 代码围栏。
+
+    上面所有提取正则都要求围栏**成对闭合**。当模型只开不闭时（响应被截断，或
+    单纯忘了收尾），没有任何模式命中，于是整段响应连同 ``` 行一起被当作代码，
+    必然抛 SyntaxError；而模型看不到自己多写了围栏，只会原样重试，表现为一次
+    无声的死循环。
+
+    这里按行剥离。关键是分清第一条围栏是"开"还是"闭"——把落单的收尾围栏当成
+    开头会连真正的代码一起丢掉：
+
+    - 带语言标注（```python）必然是开围栏；
+    - 裸 ``` 看它后面还有没有内容：有则是开围栏，没有则是落单的收尾围栏。
+
+    判定为开围栏时，其之前的自然语言（"好的，代码如下："）一并丢弃。
+    不含围栏的内容原样返回。
+    """
+    lines = code_content.split("\n")
+    fence_indices = [i for i, line in enumerate(lines) if _FENCE_LINE_RE.match(line)]
+    if not fence_indices:
+        return code_content
+
+    logger.warning(f"[Resolver] 响应中残留 {len(fence_indices)} 条代码围栏，已剥离后执行")
+
+    first = fence_indices[0]
+    has_language_tag = lines[first].strip() != "`" * 3
+    followed_by_content = any(line.strip() for line in lines[first + 1 :])
+    if has_language_tag or followed_by_content:
+        lines = lines[first + 1 :]
+
+    lines = [line for line in lines if not _FENCE_LINE_RE.match(line)]
+    return "\n".join(lines).strip()
 
 
 def fix_code_content(code_content: str) -> str:
