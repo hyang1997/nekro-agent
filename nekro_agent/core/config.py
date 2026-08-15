@@ -1200,6 +1200,26 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    AI_NOTIFY_ON_SCRIPT_FAILURE: bool = Field(
+        default=True,
+        title="代码执行彻底失败时告知用户",
+        description="迭代次数用尽仍未成功时，向会话发送一条简短的失败提示。关闭则保持静默（用户会看到机器人毫无反应）",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="模型配置",
+                en_US="Model Configuration",
+            ),
+            overridable=True,
+            i18n_title=i18n_text(
+                zh_CN="代码执行彻底失败时告知用户",
+                en_US="Notify User On Script Failure",
+            ),
+            i18n_description=i18n_text(
+                zh_CN="迭代次数用尽仍未成功时，向会话发送一条简短的失败提示；关闭则保持静默",
+                en_US="Send a short notice to the chat when all iterations are exhausted; when off, the bot stays silent",
+            ),
+        ).model_dump(),
+    )
     AI_CHAT_LLM_API_MAX_RETRIES: int = Field(
         default=3,
         title="模型 API 调用重试次数",

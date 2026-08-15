@@ -180,6 +180,11 @@ async def run_agent(
     logger.debug(f"[run_agent] {chat_key} | LLM 请求完成，开始解析响应")
     parsed_code_data: ParsedCodeRunData = parse_chat_response(llm_response.response_content)
 
+    # 循环体每轮都会重置这两个值；此处预置一次，避免迭代次数被配置为 0 时
+    # 循环体从未执行，而循环后的收尾逻辑引用到未绑定的名字
+    sandbox_output = ""
+    stop_type = ExecStopType.NORMAL
+
     for i in range(config.AI_SCRIPT_MAX_RETRY_TIMES):
         addition_prompt_message: List[OpenAIChatMessage] = []
         sandbox_output = ""
@@ -305,7 +310,7 @@ async def run_agent(
                 + (
                     f" This is the last retry. Describe the reason if you can't finish the task. (Iteration times: {i + 1}/{config.AI_SCRIPT_MAX_RETRY_TIMES})"
                     if i == config.AI_SCRIPT_MAX_RETRY_TIMES - 1
-                    else "(Iteration times: {i + 1}/{config.AI_SCRIPT_MAX_RETRY_TIMES})"
+                    else f" (Iteration times: {i + 1}/{config.AI_SCRIPT_MAX_RETRY_TIMES})"
                 ),
             ),
         )
@@ -352,6 +357,32 @@ async def run_agent(
             )
             raise
         parsed_code_data = parse_chat_response(llm_response.response_content)
+
+    # 迭代次数用尽。此前这里没有任何收尾：函数直接返回 None，既不记日志也不
+    # 发消息，用户看到的就是机器人对着一条消息毫无反应，无从判断是没收到、
+    # 还是在想、还是已经放弃。至少要让失败可见。
+    logger.error(
+        f"[run_agent] {chat_key} | 连续 {config.AI_SCRIPT_MAX_RETRY_TIMES} 次迭代仍未成功执行，放弃本轮响应"
+        f" | 最后一次: {stop_type.name} {_summarize_runtime_text(sandbox_output)}",
+    )
+    await publish_runtime_state(
+        phase="failed",
+        iteration_index=config.AI_SCRIPT_MAX_RETRY_TIMES,
+        model_name=llm_response.use_model,
+        sandbox_stop_type=stop_type.value,
+        error_summary=_summarize_runtime_text(sandbox_output),
+    )
+
+    if config.AI_NOTIFY_ON_SCRIPT_FAILURE:
+        try:
+            await ctx.send_text(
+                f"[系统] 这轮响应连续失败 {config.AI_SCRIPT_MAX_RETRY_TIMES} 次，已放弃。"
+                f"最后一次错误：{_summarize_runtime_text(sandbox_output)}",
+                record=False,
+            )
+        except Exception as e:
+            # 失败通知本身失败了也不能再把异常抛给调用方
+            logger.error(f"[run_agent] {chat_key} | 发送失败通知时出错: {e}")
 
 
 async def send_agent_request(
