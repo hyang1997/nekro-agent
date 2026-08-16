@@ -1763,6 +1763,46 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    SANDBOX_OUTPUT_LIMIT: int = Field(
+        default=8192,
+        title="沙盒输出最大长度 (字符)",
+        description="回传给模型的沙盒输出上限，超出部分会从中间截断；沙盒的 stdout 是模型唯一的观察渠道，设得太小会让「先查再答」直接丢数据",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="沙盒配置",
+                en_US="Sandbox Configuration",
+            ),
+            overridable=True,
+            i18n_title=i18n_text(
+                zh_CN="沙盒输出最大长度 (字符)",
+                en_US="Max Sandbox Output Length (characters)",
+            ),
+            i18n_description=i18n_text(
+                zh_CN="回传给模型的沙盒输出上限，超出部分会从中间截断。沙盒 stdout 是模型唯一的观察渠道，设得太小会让「先查再答」直接丢数据",
+                en_US="Cap on sandbox output returned to the model; the middle is elided beyond it. Sandbox stdout is the model's only observation channel, so a small value silently drops data from look-then-answer flows",
+            ),
+        ).model_dump(),
+    )
+    SANDBOX_OUTPUT_SPILL: bool = Field(
+        default=True,
+        title="沙盒输出溢出落盘",
+        description="输出被截断时，将完整输出写入共享目录并在截断提示里告诉模型文件路径，使其可以在下一轮读回被省略的部分",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="沙盒配置",
+                en_US="Sandbox Configuration",
+            ),
+            overridable=True,
+            i18n_title=i18n_text(
+                zh_CN="沙盒输出溢出落盘",
+                en_US="Spill Truncated Sandbox Output",
+            ),
+            i18n_description=i18n_text(
+                zh_CN="输出被截断时，将完整输出写入共享目录，并在截断提示中给出文件路径，让模型下一轮可以读回被省略的中间部分",
+                en_US="When output is truncated, write the full text to the shared directory and name the path in the truncation notice, so the model can read back the elided middle on its next iteration",
+            ),
+        ).model_dump(),
+    )
     SANDBOX_MAX_CONCURRENT: int = Field(
         default=4,
         title="最大并发沙盒数",

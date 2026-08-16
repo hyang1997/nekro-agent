@@ -321,12 +321,18 @@ def limited_text_output(text: str, limit: int = 1000, placeholder: str = "...") 
     Args:
         text (str): 文本
         limit (int): 限制长度
+        placeholder (str): 中间省略部分的占位提示
     """
 
     if len(text) <= limit:
         return text
-    left_limit = limit // 2 - len(placeholder) // 2
-    right_limit = limit - left_limit
+    # 占位符可能比 limit 更长（例如带恢复指引的截断提示）。不夹住的话 left_limit 会变成负数，
+    # text[:-n] 于是保留了几乎整段原文，截断反而把输出放大了。
+    keep = max(limit, 0)
+    left_limit = max(keep // 2 - len(placeholder) // 2, 0)
+    right_limit = max(keep - left_limit, 0)
+    if right_limit == 0:
+        return text[:left_limit] + placeholder
     return text[:left_limit] + placeholder + text[-right_limit:]
 
 

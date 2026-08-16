@@ -87,6 +87,58 @@ else
 fi
 """
 
+SPILL_DIR_NAME = ".stdout"  # 共享目录下存放完整输出的子目录
+SPILL_KEEP_FILES = 20  # 每个频道保留的溢出文件数
+
+
+def _write_output_spill(host_shared_dir: Path, output_text: str) -> Optional[str]:
+    """把完整输出写入共享目录，返回沙盒内可见的相对路径
+
+    截断只保留首尾，中间部分对模型永久丢失，而沙盒 stdout 是模型唯一的观察渠道。
+    共享目录在下一轮沙盒里会挂载到同一位置，所以把完整输出放在这里，模型可以自己读回来。
+    落盘失败不能把一次成功的执行变成失败，因此这里吞掉异常返回 None，调用方降级为纯截断提示。
+    """
+    try:
+        spill_dir = host_shared_dir / SPILL_DIR_NAME
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{time.strftime('%H%M%S')}_{os.urandom(3).hex()}.txt"
+        (spill_dir / filename).write_text(output_text, encoding="utf-8")
+        with contextlib.suppress(Exception):
+            Path.chmod(spill_dir, 0o777)
+        # 只保留最近若干个，避免共享目录被历史输出撑大
+        stale_files = sorted(spill_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[SPILL_KEEP_FILES:]
+        for stale in stale_files:
+            with contextlib.suppress(Exception):
+                stale.unlink()
+    except Exception as e:
+        logger.warning(f"沙盒输出落盘失败，本轮被截断的内容将无法恢复: {e}")
+        return None
+    return f"./shared/{SPILL_DIR_NAME}/{filename}"
+
+
+def _build_final_output(output_text: str, output_limit: int, host_shared_dir: Path) -> str:
+    """按上限截断输出，并在截断提示里给出恢复手段"""
+    if len(output_text) <= output_limit:
+        return output_text
+
+    spill_path = _write_output_spill(host_shared_dir, output_text) if config.SANDBOX_OUTPUT_SPILL else None
+    # 只说"被截断了"没用，模型需要的是"怎么把它拿回来"。恢复手段必须跟着截断提示一起
+    # 到达模型：写在系统提示里的静态说明到不了这个决策点，而这条提示恰好出现在它必须行动的时刻。
+    if spill_path:
+        slice_start = output_limit // 2
+        recovery = (
+            f" Full output saved to {spill_path} — to see the omitted middle, read a slice of it and exit(9),"
+            f" e.g. print(open('{spill_path}').read()[{slice_start}:{slice_start + output_limit}]); exit(9)"
+        )
+    else:
+        recovery = " The omitted middle is NOT recoverable — re-run printing only the part you actually need"
+    return limited_text_output(
+        output_text,
+        limit=output_limit,
+        placeholder=f"...(output truncated: {len(output_text) - output_limit} of {len(output_text)} characters hidden.{recovery})...",
+    )
+
+
 # 频道沙盒活跃时间记录表
 chat_key_sandbox_map: Dict[str, float] = {}
 
@@ -108,7 +160,7 @@ def _sanitize_docker_name_part(value: str) -> str:
 async def limited_run_code(
     code_run_data: ParsedCodeRunData,
     from_chat_key: str,
-    output_limit: int = 1000,
+    output_limit: Optional[int] = None,
     llm_response: Optional[OpenAIResponse] = None,
     chat_message: Optional[ChatMessage] = None,
     ctx: Optional[AgentCtx] = None,
@@ -119,7 +171,7 @@ async def limited_run_code(
     Args:
         code_run_data: 代码执行数据
         from_chat_key: 频道键
-        output_limit: 输出限制
+        output_limit: 输出限制，None 时取 config.SANDBOX_OUTPUT_LIMIT
         llm_response: LLM 响应
         chat_message: 聊天消息
         ctx: Agent 上下文
@@ -133,7 +185,7 @@ async def limited_run_code(
         return await run_code_in_sandbox(
             code_run_data=code_run_data,
             from_chat_key=from_chat_key,
-            output_limit=output_limit,
+            output_limit=config.SANDBOX_OUTPUT_LIMIT if output_limit is None else output_limit,
             llm_response=llm_response,
             chat_message=chat_message,
             ctx=ctx,
@@ -280,15 +332,7 @@ async def run_code_in_sandbox(
         cleanup_container_shared_dir(box_last_active_time),
     )
 
-    final_output = (
-        output_text
-        if len(output_text) <= output_limit
-        else limited_text_output(
-            output_text,
-            limit=output_limit,
-            placeholder=f"...(output too long, hidden {len(output_text) - output_limit} characters)...",
-        )
-    )
+    final_output = _build_final_output(output_text, output_limit, host_shared_dir)
 
     await DBExecCode.create(
         chat_key=from_chat_key,
