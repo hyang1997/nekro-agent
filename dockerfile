@@ -36,9 +36,13 @@ FROM python:3.11-slim-bullseye
 # 设置环境变量
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 设置时区
-RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-    echo 'Asia/Shanghai' > /etc/timezone
+# 设置时区。做成构建参数而不是写死：Agent 会按容器本地时间跟用户对话、
+# 也会按本地时间设定定时任务，时区不对会一路错下去。默认保持 Asia/Shanghai
+# 不变，非该时区的部署用 --build-arg TZ=... 覆盖，运行时也可用 TZ 环境变量再覆盖。
+ARG TZ=Asia/Shanghai
+ENV TZ=${TZ}
+RUN ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+    echo "${TZ}" > /etc/timezone
 
 RUN apt update
 
