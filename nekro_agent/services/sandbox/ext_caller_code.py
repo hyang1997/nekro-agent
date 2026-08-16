@@ -22,6 +22,9 @@ CHAT_API = "{CHAT_API}"
 CONTAINER_KEY = "{CONTAINER_KEY}"
 FROM_CHAT_KEY = "{FROM_CHAT_KEY}"
 RPC_SECRET_KEY = "{RPC_SECRET_KEY}"
+# 本次容器运行的一次性令牌。服务端据此判定调用方的真实身份，
+# 查询串里的 container_key / from_chat_key 仅供日志，不再被采信。
+CONTAINER_TOKEN = "{CONTAINER_TOKEN}"
 
 
 def __extension_method_proxy(method: Callable):
@@ -38,6 +41,7 @@ def __extension_method_proxy(method: Callable):
             headers={
                 "Content-Type": "application/octet-stream",
                 "X-RPC-Token": RPC_SECRET_KEY,
+                "X-Container-Token": CONTAINER_TOKEN,
             },
         )
         if response.status_code == 200:

@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import re
+import secrets
 import shutil
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ from nekro_agent.services.agent.openai import OpenAIResponse
 from nekro_agent.services.agent.resolver import ParsedCodeRunData
 from nekro_agent.tools.common_util import limited_text_output
 
+from . import session_registry
 from .ext_caller import CODE_PREAMBLE, get_api_caller_code
 
 # 主机共享目录
@@ -233,10 +235,18 @@ async def run_code_in_sandbox(
     HOST_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
     HOST_PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 本次运行的一次性身份令牌。此刻只是写进 api_caller.py，容器启动前才登记生效
+    container_token = secrets.token_urlsafe(32)
+
     # 写入预置依赖代码
     api_caller_file_path = Path(host_shared_dir) / API_CALLER_FILENAME
     api_caller_file_path.write_text(
-        await get_api_caller_code(container_key=container_key, from_chat_key=from_chat_key, ctx=ctx),
+        await get_api_caller_code(
+            container_key=container_key,
+            from_chat_key=from_chat_key,
+            container_token=container_token,
+            ctx=ctx,
+        ),
         encoding="utf-8",
     )
 
@@ -280,6 +290,8 @@ async def run_code_in_sandbox(
     # 使用 try/finally 确保 Docker 客户端（及其底层 aiohttp UnixConnector）在使用后被正确关闭，
     # 防止连接泄漏导致连接池耗尽后 docker.containers.run() 永久挂起
     docker = aiodocker.Docker()
+    # 令牌只在容器运行期间有效：登记在启动前，注销在退出后，不可复用
+    session_registry.register(container_token, container_key, from_chat_key)
     try:
         container: DockerContainer = await docker.containers.run(
             name=container_name,
@@ -319,6 +331,7 @@ async def run_code_in_sandbox(
             config.SANDBOX_RUNNING_TIMEOUT,
         )
     finally:
+        session_registry.unregister(container_token)
         await docker.close()
 
     # 记录执行耗时

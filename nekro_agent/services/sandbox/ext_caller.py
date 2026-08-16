@@ -19,7 +19,12 @@ def {method_name}(*args, **kwargs):
 """  #! 沙盒环境下不需要使用异步方式调用，因为实际执行是通过 RPC 调用的
 
 
-async def get_api_caller_code(container_key: str, from_chat_key: str, ctx: Optional[AgentCtx] = None):
+async def get_api_caller_code(
+    container_key: str,
+    from_chat_key: str,
+    container_token: str,
+    ctx: Optional[AgentCtx] = None,
+):
     base_code = (
         Path("nekro_agent/services/sandbox/ext_caller_code.py")
         .read_text(encoding="utf-8")
@@ -27,6 +32,7 @@ async def get_api_caller_code(container_key: str, from_chat_key: str, ctx: Optio
         .replace("{CONTAINER_KEY}", container_key)
         .replace("{FROM_CHAT_KEY}", from_chat_key)
         .replace("{RPC_SECRET_KEY}", OsEnv.RPC_SECRET_KEY)
+        .replace("{CONTAINER_TOKEN}", container_token)
     )
     methods = await plugin_collector.get_all_sandbox_methods(ctx)
 
