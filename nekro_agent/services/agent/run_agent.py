@@ -10,6 +10,7 @@ from nekro_agent.core.config import CoreConfig, ModelConfigGroup
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import PROMPT_ERROR_LOG_DIR, PROMPT_LOG_DIR
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_exec_code import ExecStopType
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.schemas.chat_message import ChatMessage
@@ -39,6 +40,31 @@ def _summarize_runtime_text(text: str, limit: int = 160) -> str:
 
 class AllLLMRequestsFailedError(ValueError):
     """All LLM API retries are exhausted for a single agent request."""
+
+
+# 补发指令。措辞是刻意具体的：DeepSeek 在同类修复里 A/B 过，不给明确指令时
+# 模型的收尾"高方差，甚至自信地编造出文件级细节"。所以这里既说清要做什么，
+# 也明确禁止编造没真正拿到的结果。
+_WRAPUP_INSTRUCTION = (
+    "[System] Your code ran successfully but sent nothing to the user, and this turn was "
+    "triggered by their message -- so right now they are looking at silence.\n"
+    "{output_block}"
+    "Reply to them now using send_msg_text. Base it strictly on the output above and what you "
+    "already know; do NOT invent results you did not actually obtain. If there is no useful "
+    "output and you cannot answer, say plainly what you tried and what you still need."
+)
+
+
+async def _bot_replied_since(chat_key: str, bot_nickname: str, since_ts: float) -> bool:
+    """本轮里机器人是否真的对用户说了话。
+
+    只认以人设名义发出的消息：系统提示以 "SYSTEM" 落库，不算对用户的回复。
+    """
+    return await DBChatMessage.filter(
+        chat_key=chat_key,
+        sender_nickname=bot_nickname,
+        send_timestamp__gte=int(since_ts),
+    ).exists()
 
 
 async def run_agent(
@@ -185,6 +211,9 @@ async def run_agent(
     sandbox_output = ""
     stop_type = ExecStopType.NORMAL
 
+    turn_start_ts = time.time()
+    wrapup_used = False  # 补发只做一次，避免和模型来回拉扯
+
     for i in range(config.AI_SCRIPT_MAX_RETRY_TIMES):
         addition_prompt_message: List[OpenAIChatMessage] = []
         sandbox_output = ""
@@ -208,13 +237,31 @@ async def run_agent(
             )
             stop_type = ExecStopType(stop_type_value)
 
+        # "代码跑通了" 和 "用户收到了回复" 在这个框架里是两件独立的事：脚本 exit 0
+        # 本轮就结束，忘了 send_msg_text 也照样算成功，用户对着空气等。由用户消息触发
+        # 却一句话没说的回合，几乎都是模型以为还能再来一轮（典型是 print(...) 查完就
+        # 结束）。这里补一轮，把 stdout 还给它并明确要求现在回复。
+        needs_wrapup = False
         if stop_type == ExecStopType.NORMAL:
-            await publish_runtime_state(
-                phase="completed",
-                iteration_index=current_iteration,
-                model_name=llm_response.use_model,
-            )
-            return
+            if (
+                chat_message is not None
+                and not wrapup_used
+                # 本轮产出的代码要到下一轮才执行，所以最后一轮补发等于白补
+                and i < config.AI_SCRIPT_MAX_RETRY_TIMES - 1
+                and not await _bot_replied_since(chat_key, preset.name, turn_start_ts)
+            ):
+                needs_wrapup = True
+                wrapup_used = True
+                logger.warning(
+                    f"[run_agent] {chat_key} | 本轮执行成功但没有回复用户，补发一轮收尾提示",
+                )
+            else:
+                await publish_runtime_state(
+                    phase="completed",
+                    iteration_index=current_iteration,
+                    model_name=llm_response.use_model,
+                )
+                return
 
         await publish_runtime_state(
             phase="sandbox_stopped",
@@ -279,6 +326,15 @@ async def run_agent(
                     "user",
                     f"[Sandbox Output] {sandbox_output}\n---\n{exception_reason_map[stop_type]}\n{suggestion_text}. {new_message_notification}",
                 ),
+            )
+
+        # 执行成功但没开口：把 stdout 交还给模型，并要求它现在回复用户
+        if needs_wrapup:
+            output_block = (
+                f"Your script printed:\n{sandbox_output}\n" if sandbox_output.strip() else "Your script printed nothing.\n"
+            )
+            msg = msg.extend(
+                OpenAIChatMessage.from_text("user", _WRAPUP_INSTRUCTION.format(output_block=output_block)),
             )
 
         # 安全类型的迭代对话
