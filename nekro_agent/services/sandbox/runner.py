@@ -89,6 +89,25 @@ else
 fi
 """
 
+def _split_end_flag(output_text: str) -> Tuple[str, Optional[ExecStopType]]:
+    """从输出末尾剥离退出标记，返回 (剥离后的文本, 标记对应的退出类型)
+
+    标记由 EXEC_SCRIPT 在 python 进程结束之后 echo，因此永远在最末尾。旧实现用
+    `flag in output_text` 全文搜索、并按字典序取第一个命中，于是脚本自己打印出来的、
+    恰好含有标记字面量的一段文本会顶掉真正的退出标记——把两个不同进程的事实混成了一个。
+    典型后果：exit(9) 的取回轮被判成 NORMAL，本轮就此静默结束，而真正的标记还留在
+    模型看到的文本里。
+
+    脚本最后一次输出若没有换行，echo 会接在同一行末尾，所以用 endswith 而不是整行相等；
+    按长度降序匹配，避免某个标记恰好是另一个标记后缀时误判。
+    """
+    stripped = output_text.rstrip()
+    for stop_type, end_flag in sorted(CODE_RUN_END_FLAGS.items(), key=lambda item: -len(item[1])):
+        if stripped.endswith(end_flag):
+            return stripped[: -len(end_flag)].strip(), stop_type
+    return output_text, None
+
+
 SPILL_DIR_NAME = ".stdout"  # 共享目录下存放完整输出的子目录
 SPILL_KEEP_FILES = 20  # 每个频道保留的溢出文件数
 
@@ -405,28 +424,21 @@ async def run_container_with_timeout(container: DockerContainer, timeout: int) -
         await container.delete()
         logger.info(f"容器 {container.id} 运行结束退出")
 
-        # 检查输出中的结束标记来确定退出类型
-        output_text = "".join(outputs).strip()
-        stop_type = ExecStopType.ERROR  # 默认为错误退出
-
-        # 移除所有结束标记并确定退出类型
-        for _type, end_flag in CODE_RUN_END_FLAGS.items():
-            if end_flag in output_text:
-                stop_type = _type
-                output_text = output_text.replace(end_flag, "").strip()
-                break
+        # 从输出末尾剥离结束标记来确定退出类型
+        output_text, flagged_type = _split_end_flag("".join(outputs).strip())
+        # 没有标记说明 shell 没走到 echo（容器被杀、镜像启动失败等），按错误处理。
+        # 注意 NORMAL == 0，这里必须显式判 None，不能用 or 兜底
+        stop_type = ExecStopType.ERROR if flagged_type is None else flagged_type
 
     except asyncio.TimeoutError:
         logger.warning(f"容器 {container.id} 运行超过 {timeout} 秒，强制停止容器")
         outputs = await container.log(stdout=True, stderr=True)
-        outputs.append(f"# This container has been killed because it exceeded the {timeout} seconds limit.")
         await container.kill()
         await container.delete()
-        output_text = "".join(outputs).strip()
-        # 移除所有可能的结束标记
-        for end_flag in CODE_RUN_END_FLAGS.values():
-            output_text = output_text.replace(end_flag, "").strip()
-        return output_text, ExecStopType.TIMEOUT
+        # 超时是权威事实，不因日志里出现标记而改判；只把真正的尾部标记从模型可见文本里剥掉
+        output_text, _ = _split_end_flag("".join(outputs).strip())
+        kill_notice = f"# This container has been killed because it exceeded the {timeout} seconds limit."
+        return f"{output_text}\n{kill_notice}".strip(), ExecStopType.TIMEOUT
     else:
         return output_text, stop_type
 
