@@ -5,7 +5,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import aiodocker
 from aiodocker.docker import DockerContainer
@@ -116,10 +116,19 @@ def _write_output_spill(host_shared_dir: Path, output_text: str) -> Optional[str
     return f"./shared/{SPILL_DIR_NAME}/{filename}"
 
 
-def _build_final_output(output_text: str, output_limit: int, host_shared_dir: Path) -> str:
+class OutputTruncation(NamedTuple):
+    """截断结果。截断与退出类型正交，所以独立上报而不是塞进 stop_type"""
+
+    text: str  # 回传给模型的文本
+    truncated: bool
+    total_chars: int  # 截断前的原始长度
+    spill_path: str  # 完整输出的落盘路径，未落盘为空串
+
+
+def _build_final_output(output_text: str, output_limit: int, host_shared_dir: Path) -> OutputTruncation:
     """按上限截断输出，并在截断提示里给出恢复手段"""
     if len(output_text) <= output_limit:
-        return output_text
+        return OutputTruncation(output_text, False, len(output_text), "")
 
     spill_path = _write_output_spill(host_shared_dir, output_text) if config.SANDBOX_OUTPUT_SPILL else None
     # 只说"被截断了"没用，模型需要的是"怎么把它拿回来"。恢复手段必须跟着截断提示一起
@@ -132,11 +141,16 @@ def _build_final_output(output_text: str, output_limit: int, host_shared_dir: Pa
         )
     else:
         recovery = " The omitted middle is NOT recoverable — re-run printing only the part you actually need"
-    return limited_text_output(
+    logger.warning(
+        f"沙盒输出超出上限被截断: {len(output_text)} 字符 > 上限 {output_limit}"
+        f"{f'，完整输出已落盘 {spill_path}' if spill_path else '，未落盘，中间部分不可恢复'}",
+    )
+    text = limited_text_output(
         output_text,
         limit=output_limit,
         placeholder=f"...(output truncated: {len(output_text) - output_limit} of {len(output_text)} characters hidden.{recovery})...",
     )
+    return OutputTruncation(text, True, len(output_text), spill_path or "")
 
 
 # 频道沙盒活跃时间记录表
@@ -332,7 +346,18 @@ async def run_code_in_sandbox(
         cleanup_container_shared_dir(box_last_active_time),
     )
 
-    final_output = _build_final_output(output_text, output_limit, host_shared_dir)
+    truncation = _build_final_output(output_text, output_limit, host_shared_dir)
+    final_output = truncation.text
+
+    ext_data = ""
+    if llm_response:
+        # 截断是独立于退出类型的事实：exit 0 的成功执行也可能只让模型看到了 2% 的输出。
+        # 单靠 outputs 字段事后分不出"输出本来就短"和"被砍掉了 39000 字"。
+        ext_data_obj = SandboxCodeExtData.create_from_llm_response(llm_response, llm_retry_errors=llm_retry_errors)
+        ext_data_obj.output_truncated = truncation.truncated
+        ext_data_obj.output_chars_total = truncation.total_chars
+        ext_data_obj.output_spill_path = truncation.spill_path
+        ext_data = ext_data_obj.model_dump_json()
 
     await DBExecCode.create(
         chat_key=from_chat_key,
@@ -352,7 +377,7 @@ async def run_code_in_sandbox(
         total_time_ms=total_time,
         trigger_user_id=str(chat_message.sender_id or "0") if chat_message else "",
         trigger_user_name=chat_message.sender_name if chat_message else "System",
-        extra_data=SandboxCodeExtData.create_from_llm_response(llm_response, llm_retry_errors=llm_retry_errors).model_dump_json() if llm_response else "",
+        extra_data=ext_data,
     )
 
     return final_output, output_text, stop_type.value

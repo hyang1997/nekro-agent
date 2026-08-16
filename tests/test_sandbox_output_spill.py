@@ -93,12 +93,12 @@ class TestBuildFinalOutput:
     """截断提示与恢复手段"""
 
     def test_under_limit_passes_through(self, tmp_path: Path):
-        assert _build_final_output("short", 1000, tmp_path) == "short"
+        assert _build_final_output("short", 1000, tmp_path).text == "short"
         assert not (tmp_path / SPILL_DIR_NAME).exists()
 
     def test_truncation_names_a_readable_path(self, tmp_path: Path):
         payload = "D" * 40000
-        result = _build_final_output(payload, 1000, tmp_path)
+        result = _build_final_output(payload, 1000, tmp_path).text
 
         assert "truncated" in result
         assert f"./shared/{SPILL_DIR_NAME}/" in result
@@ -111,7 +111,7 @@ class TestBuildFinalOutput:
 
     def test_quoted_path_in_hint_is_the_real_file(self, tmp_path: Path):
         """提示里 print(open('...')) 的路径解析回宿主机必须命中真实文件"""
-        result = _build_final_output("E" * 40000, 1000, tmp_path)
+        result = _build_final_output("E" * 40000, 1000, tmp_path).text
         quoted = result.split("open('")[1].split("')")[0]
         assert (tmp_path / quoted.replace("./shared/", "")).exists()
 
@@ -119,19 +119,73 @@ class TestBuildFinalOutput:
         from nekro_agent.core.config import config
 
         monkeypatch.setattr(config, "SANDBOX_OUTPUT_SPILL", False)
-        result = _build_final_output("F" * 40000, 1000, tmp_path)
+        result = _build_final_output("F" * 40000, 1000, tmp_path).text
 
         assert "NOT recoverable" in result
         assert not (tmp_path / SPILL_DIR_NAME).exists()
 
     def test_hidden_count_is_accurate(self, tmp_path: Path):
         payload = "G" * 5000
-        result = _build_final_output(payload, 1000, tmp_path)
+        result = _build_final_output(payload, 1000, tmp_path).text
         assert f"{5000 - 1000} of 5000 characters hidden" in result
 
     @pytest.mark.parametrize("limit", [0, 1, 50, 1000, 8192])
     def test_never_expands_the_output(self, tmp_path: Path, limit: int):
         """任何上限下，截断结果都不能比原文还长"""
         payload = "H" * 60000
-        result = _build_final_output(payload, limit, tmp_path)
+        result = _build_final_output(payload, limit, tmp_path).text
         assert len(result) < len(payload)
+
+
+class TestTruncationIsReportedIndependently:
+    """截断与退出类型正交：exit 0 的成功执行也可能只让模型看到了 2% 的输出"""
+
+    def test_untruncated_run_reports_no_truncation(self, tmp_path: Path):
+        result = _build_final_output("short output", 1000, tmp_path)
+        assert result.truncated is False
+        assert result.total_chars == len("short output")
+        assert result.spill_path == ""
+
+    def test_truncated_run_reports_original_size(self, tmp_path: Path):
+        result = _build_final_output("I" * 40000, 1000, tmp_path)
+        assert result.truncated is True
+        assert result.total_chars == 40000
+        assert result.spill_path.startswith(f"./shared/{SPILL_DIR_NAME}/")
+
+    def test_total_chars_is_the_pre_truncation_length(self, tmp_path: Path):
+        """记的必须是截断前的长度，否则事后分不出输出本来就短还是被砍了"""
+        result = _build_final_output("J" * 12345, 1000, tmp_path)
+        assert result.total_chars == 12345
+        assert len(result.text) < result.total_chars
+
+    def test_spill_path_empty_when_spill_disabled(self, tmp_path: Path, monkeypatch):
+        from nekro_agent.core.config import config
+
+        monkeypatch.setattr(config, "SANDBOX_OUTPUT_SPILL", False)
+        result = _build_final_output("K" * 40000, 1000, tmp_path)
+        assert result.truncated is True
+        assert result.spill_path == ""
+
+    def test_ext_data_defaults_are_backwards_compatible(self):
+        """老记录的 extra_data 里没有这几个字段，反序列化必须落到未截断"""
+        from nekro_agent.schemas.sandbox import SandboxCodeExtData
+
+        legacy = {
+            "message_cnt": 1,
+            "token_consumption": 10,
+            "token_input": 5,
+            "token_output": 5,
+            "chars_count_input": 100,
+            "chars_count_output": 50,
+            "chars_count_total": 150,
+            "use_model": "test",
+            "speed_tokens_per_second": 1.0,
+            "speed_chars_per_second": 1.0,
+            "first_token_cost_ms": 1,
+            "generation_time_ms": 1,
+            "stream_mode": False,
+        }
+        parsed = SandboxCodeExtData(**legacy)
+        assert parsed.output_truncated is False
+        assert parsed.output_chars_total == 0
+        assert parsed.output_spill_path == ""

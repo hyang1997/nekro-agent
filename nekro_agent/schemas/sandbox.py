@@ -22,6 +22,12 @@ class SandboxCodeExtData(BaseModel):
     log_path: str = ""
     llm_retry_count: int = 0
     llm_retry_errors: list[str] = []
+    # 输出截断与退出类型正交：脚本可以 exit 0 一切正常，同时模型只看到了 2% 的输出。
+    # 把它压进 stop_type 就是在另一个地方重复同一个混淆，所以单独记录。
+    # 老记录没有这几个字段，默认值即"未截断"。
+    output_truncated: bool = False
+    output_chars_total: int = 0
+    output_spill_path: str = ""
 
     @classmethod
     def create_from_llm_response(
