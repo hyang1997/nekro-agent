@@ -21,8 +21,13 @@
 
 ## 配置说明
 
-需要一个**细粒度只读** GitHub PAT：仓库限定 `health-dashboard-hao`，权限
-`Contents: Read`。填在 `GITHUB_TOKEN` 里。
+需要一个细粒度 GitHub PAT，仓库限定 `health-dashboard-hao`，权限
+`Contents: Read`（读数据）+ `Actions: Write`（触发刷新）。填在 `GITHUB_TOKEN` 里。
+
+`Actions: Write` 是有代价的：Agent 的输入里有 Discord 消息这类不可信内容，被
+注入时最坏情况是反复触发工作流、烧 Actions 额度。工作流侧用 `concurrency` 兜底，
+不会并发跑出竞态。仓库 secrets（Garmin 账密）不会因此泄露——它们不进日志。
+只想要只读时把权限降到 `Contents: Read`，`refresh_health_data` 会明确报错。
 """
 
 import datetime
@@ -86,6 +91,21 @@ class HealthConfig(ConfigBase):
         description="仓库内的 profile JSON 路径。换成 jessie.json 即可读另一位。",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="数据文件路径", en_US="Profile Path"),
+        ).model_dump(),
+    )
+    WORKFLOW_FILE: str = Field(
+        default="agent-refresh.yml",
+        title="刷新用的工作流",
+        description="`refresh_health_data` 触发的 GitHub Actions 工作流文件名",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="刷新用的工作流", en_US="Refresh Workflow"),
+        ).model_dump(),
+    )
+    WORKFLOW_REF: str = Field(
+        default="master",
+        title="工作流分支",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="工作流分支", en_US="Workflow Ref"),
         ).model_dump(),
     )
     BASELINE_DAYS: int = Field(
@@ -165,6 +185,64 @@ def _delta(value: Optional[float], base: Optional[float]) -> Optional[float]:
     if value is None or base is None:
         return None
     return round(value - base, 1)
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    name="刷新健康数据",
+    description="触发一次 Garmin 拉取，让数据更新到最新（约 1-2 分钟后生效）",
+)
+async def refresh_health_data(_ctx: AgentCtx) -> str:
+    """Start a fresh Garmin pull. Returns immediately -- it does NOT wait.
+
+    The pull takes roughly one to two minutes to run and commit. Do not call
+    this and then immediately read the data expecting it to have changed; the
+    normal morning pattern is to refresh a few minutes before the brief, then
+    read. If you refresh and read in the same breath you will get the previous
+    pull, and `data_is_today` will tell you so.
+
+    Only worth calling once a day, before the morning brief. Sleep, HRV,
+    readiness and body battery are computed once after waking -- refreshing
+    again later in the day returns the same numbers.
+
+    Returns:
+        str: Confirmation that the refresh was queued.
+    """
+    if not config.GITHUB_TOKEN:
+        raise RuntimeError(
+            "[Health] 未配置 GITHUB_TOKEN，无法触发刷新。这不是临时错误，重试无用——请告知用户。",
+        )
+
+    url = f"https://api.github.com/repos/{config.REPO}/actions/workflows/{config.WORKFLOW_FILE}/dispatches"
+    async with AsyncClient() as client:
+        response = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {config.GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"ref": config.WORKFLOW_REF},
+            timeout=Timeout(read=30, write=30, connect=10, pool=10),
+        )
+
+    if response.status_code == 403:
+        raise RuntimeError(
+            "[Health] token 缺少 Actions: Write 权限，无法触发工作流。"
+            "这不是临时错误，重试无用——请让用户给 PAT 加上该权限。",
+        )
+    if response.status_code == 404:
+        raise RuntimeError(
+            f"[Health] 找不到工作流 {config.WORKFLOW_FILE}，或 token 无权访问。这不是临时错误。",
+        )
+    response.raise_for_status()
+
+    # 拉取完成后仓库内容会变，本地缓存必须作废，否则下一次读到的还是旧的
+    _cache["at"] = 0.0
+    _cache["data"] = None
+
+    core.logger.info(f"[Health] 已触发 {config.WORKFLOW_FILE} 刷新")
+    return "Garmin refresh queued; fresh data lands in about 1-2 minutes."
 
 
 @plugin.mount_sandbox_method(
