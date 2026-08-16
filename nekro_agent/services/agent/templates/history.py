@@ -37,6 +37,28 @@ from .base import PromptTemplate, env, register_template
 logger = get_sub_logger("agent_runtime")
 
 
+def _trim_history_to_budget(prompts: List[str], budget: int) -> Tuple[List[str], int]:
+    """按字符预算从后往前保留较新的消息，返回 (保留的记录, 被省略的条数)
+
+    至少保留最新一条：单条消息就超预算时，旧实现会把整段历史清空，模型于是对着
+    完全空白的上下文回答用户刚说的话。宁可超一点预算，也不能连触发本轮的那条都丢掉。
+    """
+    if not prompts:
+        return prompts, 0
+
+    total_length = 0
+    start_idx = 0
+    for i in range(len(prompts) - 1, -1, -1):
+        prompt_length = len(prompts[i])
+        if total_length + prompt_length > budget:
+            start_idx = i + 1  # 从下一条消息开始保留
+            break
+        total_length += prompt_length
+
+    start_idx = min(start_idx, len(prompts) - 1)
+    return prompts[start_idx:], start_idx
+
+
 def _preview_text(value: str, limit: int = 160) -> str:
     compact = " ".join(value.strip().split())
     if len(compact) <= limit:
@@ -637,20 +659,30 @@ async def render_history_data(
         )
 
     # 确保总记录长度不超过最大字符长度（从后往前累积，保留较新的消息）
-    total_length = 0
-    start_idx = 0
-    for i in range(len(chat_history_prompts) - 1, -1, -1):
-        prompt_length = len(chat_history_prompts[i])
-        if total_length + prompt_length > config.AI_CONTEXT_LENGTH_PER_SESSION:
-            start_idx = i + 1  # 从下一条消息开始保留
-            break
-        total_length += prompt_length
-    chat_history_prompts = chat_history_prompts[start_idx:]
+    chat_history_prompts, omitted_count = _trim_history_to_budget(
+        chat_history_prompts,
+        config.AI_CONTEXT_LENGTH_PER_SESSION,
+    )
 
     chat_history_prompt = f"\n<{one_time_code} | message separator>\n".join(chat_history_prompts)
     chat_history_prompt += f"\n<{one_time_code} | message separator>\n"
+    if omitted_count:
+        # 只丢不说的话，模型无从分辨"对话刚开始"和"刚被截掉四十轮"，于是把窗口边界
+        # 当成会话起点，重复问已经问过的事、或者认定某件事没发生过。
+        # 这里不点名具体的查历史方法：能不能查取决于装了哪些插件，编一个不存在的方法名
+        # 比不给建议更糟。
+        chat_history_prompt = (
+            f"[Context Notice] {omitted_count} earlier message(s) from this conversation are NOT shown below "
+            f"— the context window is full, the conversation did not start here. Do not treat the first "
+            f"message below as the beginning. If you need what was said earlier, use a history or memory "
+            f"lookup method if one is listed among your available methods; otherwise ask the user rather "
+            f"than assuming.\n"
+        ) + chat_history_prompt
     openai_chat_message.add(ContentSegment.text_content(chat_history_prompt))
 
-    logger.info(f"加载最近 {len(recent_chat_messages)} 条对话记录 ({len(ref_msg_set)} 条引用相关消息)")
+    logger.info(
+        f"加载最近 {len(chat_history_prompts)} 条对话记录 "
+        f"(共 {len(recent_chat_messages)} 条, 超预算省略 {omitted_count} 条, {len(ref_msg_set)} 条引用相关消息)",
+    )
 
     return openai_chat_message
