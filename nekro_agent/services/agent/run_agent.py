@@ -108,6 +108,45 @@ _STOP_TYPE_SUGGESTIONS: Dict[ExecStopType, str] = {
 }
 
 
+# 连续提交同一份脚本时的提醒阈值。只提醒，不拦截——合法的重复调用不该被框架否决，
+# 要不要换路子由模型自己判断。数值比 DeepSeek 的 (3, 5, 8) 更早，因为这里一轮迭代
+# 是"一次完整生成 + 一次容器启动"，比一次普通工具调用贵得多。
+_REPEAT_THRESHOLDS = (2, 4, 6)
+
+_REPEAT_FIRST_REMINDER = (
+    "[System] You just submitted the exact same script as your previous attempt. Read the sandbox output "
+    "above before writing more code: if it did not work, change the approach or the arguments instead of "
+    "resending identical code."
+)
+
+_REPEAT_DETAILED_REMINDER = (
+    "[System] Repeated script detected: you have submitted byte-identical code {count} times in a row and "
+    "the result has not changed. Do NOT submit this script again. Either take a genuinely different "
+    "approach, or stop and tell the user with send_msg_text what you tried and what is blocking you."
+)
+
+
+def _canonical_code(code: str) -> str:
+    """脚本指纹：去掉行尾空白和空行，保留缩进（缩进在 Python 里是语义）"""
+    lines = [line.rstrip() for line in code.replace("\r\n", "\n").split("\n")]
+    return "\n".join(line for line in lines if line)
+
+
+def _repeat_reminder(repeat_count: int) -> str:
+    """连续重复到阈值时给出的提醒，未到阈值返回空串
+
+    超过最高阈值后继续提醒（DeepSeek 的实现在这里会转为静默）：本框架的迭代上限只有
+    个位数，越界后剩下的几轮正是最该被打断的，没必要留给它安静地烧完。
+    """
+    if repeat_count < _REPEAT_THRESHOLDS[0]:
+        return ""
+    if repeat_count == _REPEAT_THRESHOLDS[0]:
+        return _REPEAT_FIRST_REMINDER
+    if repeat_count in _REPEAT_THRESHOLDS or repeat_count > _REPEAT_THRESHOLDS[-1]:
+        return _REPEAT_DETAILED_REMINDER.format(count=repeat_count)
+    return ""
+
+
 def _resolve_suggestion(sandbox_output: str, stop_type: ExecStopType, timeout: int) -> str:
     """给本轮失败挑一条可执行的恢复建议，没有合适的就返回空串"""
     if stop_type in _STOP_TYPE_SUGGESTIONS:
@@ -276,12 +315,26 @@ async def run_agent(
 
     turn_start_ts = time.time()
     wrapup_used = False  # 补发只做一次，避免和模型来回拉扯
+    repeat_signature = ""  # 上一轮脚本的归一化指纹
+    repeat_count = 0  # 连续提交同一份脚本的次数
 
     for i in range(config.AI_SCRIPT_MAX_RETRY_TIMES):
         addition_prompt_message: List[OpenAIChatMessage] = []
         sandbox_output = ""
         raw_output = ""
         current_iteration = i + 1
+
+        # 连续重复检测。一轮迭代 = 一次完整生成 + 一次容器启动，代价远高于普通工具调用，
+        # 而模型把上一轮的报错原样再跑一遍，基本等同于没看输出。计数只在本轮对话内有效。
+        signature = _canonical_code(parsed_code_data.code_content)
+        if signature and signature == repeat_signature:
+            repeat_count += 1
+        else:
+            repeat_signature = signature
+            repeat_count = 1
+        if repeat_count > 1:
+            logger.warning(f"[run_agent] {chat_key} | 模型连续第 {repeat_count} 次提交同一份脚本")
+
         if one_time_code in parsed_code_data.code_content:
             stop_type = ExecStopType.SECURITY
         else:
@@ -382,6 +435,12 @@ async def run_agent(
                     f"{suggestion_text}\n{new_message_notification}",
                 ),
             )
+
+        # 重复提交提醒。放在具体报错建议之后：先让模型看到这次为什么失败，再告诉它
+        # "你已经这样试过 N 次了"。
+        repeat_reminder = _repeat_reminder(repeat_count)
+        if repeat_reminder:
+            msg = msg.extend(OpenAIChatMessage.from_text("user", repeat_reminder))
 
         # 执行成功但没开口：把 stdout 交还给模型，并要求它现在回复用户
         if needs_wrapup:
