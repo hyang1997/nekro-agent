@@ -115,6 +115,16 @@ class ImapSmtpPasswordClient:
         conn = self._require_conn()
         return await asyncio.to_thread(self._get_mailbox_folders_sync, conn)
 
+    async def uid_command(self, command: str, *args: str) -> tuple[str, list]:
+        """执行任意 IMAP UID 命令
+
+        为插件保留的通用出口：服务商自有扩展（如 Gmail 的 X-GM-RAW / X-GM-LABELS /
+        X-GM-THRID）无法用固定方法穷举，而绕过这里就只能去够 `_require_conn()`。
+        读取类调用请使用 BODY.PEEK 而非 BODY，后者会把邮件标记为已读。
+        """
+        conn = self._require_conn()
+        return await asyncio.to_thread(conn.uid, command, *args)
+
     async def list_message_ids(self, unseen_only: bool) -> list[bytes]:
         conn = self._require_conn()
         criteria = "UNSEEN" if unseen_only else "ALL"
