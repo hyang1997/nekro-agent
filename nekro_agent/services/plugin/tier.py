@@ -30,7 +30,7 @@ because the gateway resolves the channel from the server-side session registry r
 than the caller's self-reported `from_chat_key`.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 from nekro_agent.core.config import CoreConfig, config
 from nekro_agent.core.logger import get_sub_logger
@@ -68,6 +68,32 @@ def is_plugin_allowed(plugin_key: str, effective_config: CoreConfig) -> bool:
     if not plugin_requires_private(plugin_key, effective_config):
         return True
     return channel_tier(effective_config) == TIER_PRIVATE
+
+
+async def is_plugin_allowed_in_channel(chat_key: str, plugin_key: str) -> Tuple[bool, str]:
+    """Authoritative check for the RPC gate. Returns (allowed, tier).
+
+    Resolves the channel config from `chat_key` rather than from an `AgentCtx`. That is not
+    a style choice: `AgentCtx._db_chat_channel` is a Pydantic **private attribute**, so v2
+    silently drops it when passed to the constructor and it reads back as None. A gate
+    written as `if ctx.db_chat_channel else <skip>` therefore skips instead of refusing —
+    which is how the first version of this shipped and let a public channel read the inbox.
+
+    Fails closed. If the tier cannot be determined the answer is "no": an unresolvable
+    channel must not be handed personal data just because a lookup broke.
+    """
+    if not plugin_requires_private(plugin_key):
+        return True, ""
+
+    try:
+        from nekro_agent.services.config_resolver import config_resolver
+
+        effective_config = await config_resolver.get_effective_config(chat_key)
+    except Exception as e:
+        logger.error(f"无法解析频道 {chat_key} 的信任等级，按 public 拒绝: {e}")
+        return False, TIER_PUBLIC
+
+    return is_plugin_allowed(plugin_key, effective_config), channel_tier(effective_config)
 
 
 def plugin_key_for_method(method_name: str) -> Optional[str]:

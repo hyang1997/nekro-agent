@@ -13,9 +13,8 @@ from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.schema import SandboxMethodType
 from nekro_agent.services.plugin.utils import get_sandbox_method_type
 from nekro_agent.services.plugin.tier import (
-    channel_tier,
     denial_message,
-    is_plugin_allowed,
+    is_plugin_allowed_in_channel,
     plugin_key_for_method,
 )
 from nekro_agent.services.rpc_service import decode_rpc_request, execute_rpc_method
@@ -73,11 +72,11 @@ async def rpc_exec(
     # session.chat_key comes from the server-side registry, not the caller's query string.
     plugin_key = plugin_key_for_method(rpc_request.method)
     if plugin_key:
-        effective_config = await ctx.db_chat_channel.get_effective_config() if ctx.db_chat_channel else None
-        if effective_config is not None and not is_plugin_allowed(plugin_key, effective_config):
+        allowed, tier = await is_plugin_allowed_in_channel(session.chat_key, plugin_key)
+        if not allowed:
             logger.warning(
                 f"拒绝调用 {rpc_request.method}: 插件 {plugin_key} 仅限 private 频道，"
-                f"而 {session.chat_key} 的等级是 {channel_tier(effective_config)}",
+                f"而 {session.chat_key} 的等级是 {tier}",
             )
             return Response(
                 content=denial_message(plugin_key, rpc_request.method),

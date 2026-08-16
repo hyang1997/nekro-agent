@@ -103,6 +103,82 @@ class TestIsPluginAllowed:
         assert not is_plugin_allowed(key, _Cfg(tier="public", private_plugins=self.PRIVATE_PLUGINS))
 
 
+class TestIsPluginAllowedInChannel:
+    """The RPC gate's entry point.
+
+    Regression: the first version read the channel off `AgentCtx.db_chat_channel`. That is
+    backed by a Pydantic *private* attribute, which v2 silently drops when passed to the
+    constructor, so it always read back as None — and the gate was written to skip when it
+    could not find a channel. A public channel read the whole inbox. The lesson is not
+    "check for None", it is that this decision must fail closed.
+    """
+
+    @pytest.fixture
+    def _patched(self, monkeypatch):
+        from nekro_agent.services.plugin import tier as tier_mod
+
+        monkeypatch.setattr(
+            tier_mod,
+            "plugin_requires_private",
+            lambda key, cfg=None: key == "Hao.gmail",
+        )
+        return tier_mod
+
+    async def _resolve_to(self, monkeypatch, cfg_or_exc):
+        import nekro_agent.services.config_resolver as cr
+
+        async def fake(chat_key):
+            if isinstance(cfg_or_exc, Exception):
+                raise cfg_or_exc
+            return cfg_or_exc
+
+        monkeypatch.setattr(cr.config_resolver, "get_effective_config", fake)
+
+    async def test_ordinary_plugin_skips_resolution(self, _patched, monkeypatch):
+        """send_msg_text runs on every turn; it must not pay for a config resolve."""
+        await self._resolve_to(monkeypatch, RuntimeError("must not be called"))
+        allowed, _ = await _patched.is_plugin_allowed_in_channel("any", "KroMiose.basic")
+        assert allowed
+
+    async def test_private_plugin_in_private_channel(self, _patched, monkeypatch):
+        await self._resolve_to(monkeypatch, _Cfg(tier="private", private_plugins=["Hao.gmail"]))
+        allowed, tier = await _patched.is_plugin_allowed_in_channel("dm", "Hao.gmail")
+        assert allowed
+        assert tier == TIER_PRIVATE
+
+    async def test_private_plugin_in_public_channel(self, _patched, monkeypatch):
+        await self._resolve_to(monkeypatch, _Cfg(tier="public", private_plugins=["Hao.gmail"]))
+        allowed, tier = await _patched.is_plugin_allowed_in_channel("guild", "Hao.gmail")
+        assert not allowed
+        assert tier == TIER_PUBLIC
+
+    async def test_unconfigured_channel_is_refused(self, _patched, monkeypatch):
+        await self._resolve_to(monkeypatch, _Cfg(private_plugins=["Hao.gmail"]))
+        allowed, _ = await _patched.is_plugin_allowed_in_channel("brand-new", "Hao.gmail")
+        assert not allowed
+
+    async def test_resolution_failure_fails_closed(self, _patched, monkeypatch):
+        """A broken lookup must deny, not wave it through — the original bug's shape."""
+        await self._resolve_to(monkeypatch, RuntimeError("db down"))
+        allowed, tier = await _patched.is_plugin_allowed_in_channel("whatever", "Hao.gmail")
+        assert not allowed
+        assert tier == TIER_PUBLIC
+
+
+class TestAgentCtxPrivateAttrTrap:
+    """Pins the language behaviour that caused the fail-open, so it cannot silently return."""
+
+    def test_private_attr_is_dropped_by_constructor(self):
+        from nekro_agent.schemas.agent_ctx import AgentCtx
+
+        ctx = AgentCtx(from_chat_key="x", _db_chat_channel="not-a-channel")  # type: ignore[arg-type]
+        assert ctx.db_chat_channel is None, (
+            "AgentCtx now preserves _db_chat_channel through the constructor. That is fine, "
+            "but the RPC tier gate deliberately does not depend on it — see "
+            "is_plugin_allowed_in_channel."
+        )
+
+
 class TestDenialMessage:
     def test_names_the_method_and_plugin(self):
         msg = denial_message("Hao.gmail", "search_gmail")
