@@ -313,9 +313,27 @@ async def get_health_data(_ctx: AgentCtx) -> str:
     if len(weekly) >= 2 and weekly[-2].get("km"):
         wow = round((weekly[-1]["km"] - weekly[-2]["km"]) / weekly[-2]["km"] * 100, 1)
 
+    # meta.phase 是 collector 写死的字段，实测会过期（2026-08-16 仍写着 BASE PHASE，
+    # 而赛事的 phases 表里 Build 早在 07-27 就开始了）。训练阶段直接决定"今天该练多狠"，
+    # 所以按日期从 phases 表现算，meta.phase 只作兜底。
+    phase = data.get("meta", {}).get("phase")
+    phase_note = ""
+
     race_line = ""
     for event in data.get("events") or []:
         if event.get("id") == data.get("activeEventId"):
+            for p in event.get("phases") or []:
+                try:
+                    start = datetime.date.fromisoformat(p["start"])
+                    end = datetime.date.fromisoformat(p["end"])
+                except (KeyError, ValueError):
+                    continue
+                if start <= datetime.date.today() <= end:
+                    derived = f"{p.get('label')} ({p['start']} to {p['end']})"
+                    if phase and p.get("label", "").lower() not in phase.lower():
+                        phase_note = f"  (dashboard meta.phase still says '{phase}' -- stale, ignore it)"
+                    phase = derived
+                    break
             days_out = ""
             if event.get("raceDate"):
                 try:
@@ -368,7 +386,7 @@ async def get_health_data(_ctx: AgentCtx) -> str:
             f"overnight low {readiness.get('bodyBatteryLow')}, peak {readiness.get('bodyBatteryHigh')}",
             "",
             "TRAINING",
-            f"  phase       {data.get('meta', {}).get('phase')}",
+            f"  phase       {phase}{phase_note}",
             f"  race        {race_line}",
             "  weekly km   " + " -> ".join(f"{w.get('km')}" for w in weekly[-4:])
             + (f"  (latest week {_signed(wow)}% vs previous)" if wow is not None else ""),
