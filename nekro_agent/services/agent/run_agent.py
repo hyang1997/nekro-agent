@@ -55,6 +55,69 @@ _WRAPUP_INSTRUCTION = (
 )
 
 
+# 报错到达模型时，附上"下一步该做什么"。写在系统提示里的静态说明到不了这个决策点：
+# 失败发生在半途，而这条建议恰好出现在模型必须决定怎么重试的那一刻。
+# 顺序敏感——先命中的先用，所以更具体的异常放前面（IndentationError 必须在 SyntaxError 之前，
+# 因为它是 SyntaxError 的子类，traceback 里两个名字都可能出现）。
+_EXCEPTION_SUGGESTIONS: List[Tuple[str, str]] = [
+    (
+        "IndentationError",
+        "Re-emit the ENTIRE script with consistent indentation. Do not wrap it in markdown fences, "
+        "headings, or prose — anything that is not Python breaks the parse.",
+    ),
+    (
+        "SyntaxError",
+        "You are prohibited from adding anything other than the content of the code that might break the "
+        "syntax of the code. Please ensure your output specification and try again",
+    ),
+    (
+        "ModuleNotFoundError",
+        "That package is NOT installed in the sandbox. Either install and import it at runtime with "
+        'dynamic_importer("<package>"), or solve the task using the dependencies listed in your prompt.',
+    ),
+    (
+        "ImportError",
+        "Check the import name against the package name — they often differ. If the package is genuinely "
+        'absent, install it at runtime with dynamic_importer("<package>").',
+    ),
+    (
+        "NameError",
+        "You used a name that does not exist. Predefined methods are ONLY the ones declared in the plugin "
+        "blocks above; you must not invent method names, and you must not import or redefine them. Use a "
+        "method that actually exists, or do the work in plain Python.",
+    ),
+    (
+        "FileNotFoundError",
+        "Files must live under ./shared/, and that directory is cleared after a period of inactivity, so a "
+        "path from an earlier conversation may already be gone. Confirm before using it: "
+        "print(os.listdir('./shared')); exit(9)",
+    ),
+    (
+        "TypeError",
+        "Re-read the signature of the predefined method in the plugin block above and pass exactly the "
+        "arguments it declares. Do not guess parameter names, order, or types.",
+    ),
+]
+
+# 按退出类型给的建议，与 traceback 文本无关
+_STOP_TYPE_SUGGESTIONS: Dict[ExecStopType, str] = {
+    ExecStopType.TIMEOUT: (
+        "The sandbox is killed at {timeout} seconds. Do not sleep, poll, or retry in a loop inside the "
+        "script — split the work across iterations and fetch less per run."
+    ),
+}
+
+
+def _resolve_suggestion(sandbox_output: str, stop_type: ExecStopType, timeout: int) -> str:
+    """给本轮失败挑一条可执行的恢复建议，没有合适的就返回空串"""
+    if stop_type in _STOP_TYPE_SUGGESTIONS:
+        return _STOP_TYPE_SUGGESTIONS[stop_type].format(timeout=timeout)
+    for marker, suggestion in _EXCEPTION_SUGGESTIONS:
+        if marker in sandbox_output:
+            return suggestion
+    return ""
+
+
 async def _bot_replied_since(chat_key: str, bot_nickname: str, since_ts: float) -> bool:
     """本轮里机器人是否真的对用户说了话。
 
@@ -307,24 +370,16 @@ async def run_agent(
             ExecStopType.MULTIMODAL_AGENT: "Sandbox exited due to multimodal agent method",
         }
 
-        # 异常处理建议
-        exception_suggestion_map: Dict[str, str] = {
-            "SyntaxError": "You are prohibited from adding anything other than the content of the code that might break the syntax of the code. Please ensure your output specification and try again",
-        }
-
         new_message_notification = "During the generation and execution, the following messages were sent (You **CANT NOT** send any messages which you have sent before!):"
 
         if stop_type in exception_reason_map:
-            for suggestion_key in exception_suggestion_map:
-                if suggestion_key in sandbox_output:
-                    suggestion_text = f"\nResolve Suggestion: {exception_suggestion_map[suggestion_key]}"
-                    break
-            else:
-                suggestion_text = ""
+            suggestion = _resolve_suggestion(sandbox_output, stop_type, config.SANDBOX_RUNNING_TIMEOUT)
+            suggestion_text = f"\nResolve Suggestion: {suggestion}" if suggestion else ""
             msg = msg.extend(
                 OpenAIChatMessage.from_text(
                     "user",
-                    f"[Sandbox Output] {sandbox_output}\n---\n{exception_reason_map[stop_type]}\n{suggestion_text}. {new_message_notification}",
+                    f"[Sandbox Output] {sandbox_output}\n---\n{exception_reason_map[stop_type]}"
+                    f"{suggestion_text}\n{new_message_notification}",
                 ),
             )
 
