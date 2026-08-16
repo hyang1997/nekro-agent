@@ -18,8 +18,14 @@
 25-60 分钟，靠 cron 抢在早报前面并不可靠。因此改由 Agent 自己在早报前几分钟调用
 `refresh_health_data()` 触发 `agent-refresh.yml`（实测约 25 秒即完成数据提交）。
 
-本插件会检查 `meta.pullDate` 是否为今天，并在输出里如实标注——数据不新时要说明，
-不能拿前天的睡眠冒充昨晚的。
+## 日期一律取自指标自身的 `date`，不要用 `meta.pullDate`
+
+`pullDate` 是 collector 按 **UTC** 打的时间戳。多伦多晚上 20:00 之后 UTC 已经跨到
+第二天，模型会把它当成"这批数据是哪天的"而整整记错一天——真的发生过：8/15 的睡眠
+被写进记忆变成了「8月16日早上的健康数据」。各指标（sleep / hrv / restingHr /
+readiness）都自带正确的本地 `date`，输出和新鲜度判断都以它为准。
+
+数据不新时会明确警告，不能拿前天的睡眠冒充昨晚的。
 
 ## 方法类型（重要）
 
@@ -279,6 +285,7 @@ async def get_health_data(_ctx: AgentCtx) -> str:
     """
     data = await _fetch_profile()
 
+    # pullDate 仅用于诊断，不进模型可见文本（见下方 metric_date 注释）
     pull_date = data.get("meta", {}).get("pullDate", "")
     today = datetime.date.today().isoformat()
 
@@ -321,22 +328,27 @@ async def get_health_data(_ctx: AgentCtx) -> str:
 
     rp = data.get("racePredictions") or {}
 
-    # pullDate 是 collector 按 UTC 打的，本地是多伦多时间，所以晚上 20:00 之后
-    # UTC 已经是第二天——用 == 判断会把刚拉的新数据判成过期。只有严格早于本地
-    # 今天才算旧。
+    # 日期一律用指标自身的 date，不要用 meta.pullDate。pullDate 是 collector 按 UTC
+    # 打的时间戳：多伦多晚上 20:00 之后 UTC 已经是第二天，模型会把它当成"这批数据是
+    # 哪天的"而记错一天——实际发生过，记忆里把 8/15 的数据写成了 8/16。
+    metric_date = sleep.get("date") or readiness.get("date") or ""
     try:
-        days_stale = (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(pull_date)).days
+        days_stale = (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(metric_date)).days
     except ValueError:
         days_stale = None
 
     if days_stale is None:
-        freshness = f"Data pull date unreadable ({pull_date!r}); treat freshness as unknown."
+        freshness = f"Metric date unreadable ({metric_date!r}); treat freshness as unknown."
     elif days_stale <= 0:
-        freshness = f"Data pulled {pull_date} -- current, these are last night's numbers."
+        freshness = (
+            f"These are the numbers FOR {metric_date} -- last night's sleep and this morning's "
+            f"recovery. Use {metric_date} as the date if you refer to one at all."
+        )
     else:
         freshness = (
-            f"WARNING: data is {days_stale} day(s) stale (pulled {pull_date}, today is {today}). "
-            "These are NOT last night's numbers -- say so instead of presenting them as this morning's."
+            f"WARNING: the newest numbers are for {metric_date}, which is {days_stale} day(s) before "
+            f"today ({today}). These are NOT last night's -- say so instead of presenting them as "
+            "this morning's."
         )
 
     return "\n".join(
