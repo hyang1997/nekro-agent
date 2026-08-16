@@ -16,6 +16,7 @@ from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.schemas.chat_message import ChatMessage
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.prompt_activation import build_plugin_activation_rules
+from nekro_agent.services.plugin.tier import channel_tier, is_plugin_allowed
 from nekro_agent.services.sandbox.runner import limited_run_code
 
 from .creator import OpenAIChatMessage
@@ -200,8 +201,18 @@ async def run_agent(
     activation_plugin = plugin_collector.get_plugin_by_module_name("plugin_activation")
     activation_enabled = bool(activation_plugin and activation_plugin.is_enabled)
 
+    # Drop private-only plugins in public channels before rendering. This is presentation,
+    # not authority — the RPC gateway is what actually refuses the call — but hiding the
+    # block saves the tokens and stops the model planning around a tool it cannot use.
+    # `config` here is the channel's effective config, so the tier override applies.
+    all_active = plugin_collector.get_all_active_plugins()
+    active_plugins = [p for p in all_active if is_plugin_allowed(p.key, config)]
+    if len(active_plugins) != len(all_active):
+        hidden = [p.key for p in all_active if not is_plugin_allowed(p.key, config)]
+        logger.info(f"[run_agent] {chat_key} | 频道等级 {channel_tier(config)}，隐藏私密插件: {hidden}")
+
     rendered_plugins = await render_plugins_prompt(
-        plugin_collector.get_all_active_plugins(),
+        active_plugins,
         ctx,
         activation_enabled=activation_enabled,
     )

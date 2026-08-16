@@ -2256,6 +2256,50 @@ class CoreConfig(ConfigBase):
     )
 
     """插件配置"""
+    CHANNEL_TIER: str = Field(
+        default="public",
+        title="频道信任等级",
+        description=(
+            "private = 只有你能发言、只有你能看到输出；public = 其他人可以发言或看到输出。"
+            "默认 public 是有意为之：新频道在被显式标记为 private 之前一律按不可信处理。"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            i18n_category=i18n_text(zh_CN="聊天配置", en_US="Chat Configuration"),
+            i18n_title=i18n_text(zh_CN="频道信任等级", en_US="Channel Trust Tier"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "private = 只有你能发言、只有你能看到输出；public = 其他人可以发言或看到输出。"
+                    "默认 public：新频道在被显式标记为 private 之前一律按不可信处理。"
+                ),
+                en_US=(
+                    "private = only you can write here and only you can read the output; "
+                    "public = other people can write or read. Defaults to public on purpose: a new "
+                    "channel is untrusted until it is explicitly marked private."
+                ),
+            ),
+        ).model_dump(),
+    )
+    PLUGIN_REQUIRE_PRIVATE: List[str] = Field(
+        default=[],
+        title="仅限私密频道的插件",
+        description=(
+            "这些插件只在 CHANNEL_TIER=private 的频道里可用，在 public 频道既不出现在提示词里，"
+            "调用也会被 RPC 网关拒绝。用于读取个人数据或有外部副作用的插件。"
+        ),
+        json_schema_extra=ExtraField(
+            sub_item_name="插件 key",
+            i18n_category=i18n_text(zh_CN="插件配置", en_US="Plugin Configuration"),
+            i18n_title=i18n_text(zh_CN="仅限私密频道的插件", en_US="Private-only Plugins"),
+            i18n_description=i18n_text(
+                zh_CN="这些插件只在 private 频道可用；public 频道里既不可见，调用也会被拒绝",
+                en_US=(
+                    "These plugins are available only in private channels; in public channels they are "
+                    "hidden from the prompt and calls are rejected."
+                ),
+            ),
+        ).model_dump(),
+    )
     PLUGIN_ENABLED: List[str] = Field(
         default=["KroMiose.basic", "KroMiose.plugin_activation"],
         title="启用插件",
