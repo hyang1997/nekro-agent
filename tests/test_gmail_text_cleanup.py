@@ -108,6 +108,88 @@ class TestHtmlToText:
         assert len(out) < 200, f"still {len(out)} characters after cleanup"
 
 
+class TestBodyWindowing:
+    """Pure windowing arithmetic used by read_gmail's offset continuation.
+
+    Regression: read_gmail showed 4000 characters of a 14272-character Expedia confirmation
+    and said only "10272 characters omitted". The model, having also run three hotel searches
+    that returned nothing, reported that the omitted part contained a hotel receipt. A notice
+    that states a limit without naming the recovery is an invitation to invent the remainder.
+    """
+
+    @staticmethod
+    def _window(total_len: int, offset: int, size: int):
+        body = "x" * total_len
+        window = body[offset : offset + size]
+        return window, offset + len(window), len(body)
+
+    def test_first_window(self):
+        window, end, total = self._window(14272, 0, 8000)
+        assert len(window) == 8000
+        assert end == 8000
+        assert total == 14272
+
+    def test_continuation_covers_the_rest(self):
+        _, end, total = self._window(14272, 8000, 8000)
+        assert end == total, "a second read must reach the end of this message"
+
+    def test_windows_are_contiguous_and_complete(self):
+        total_len, size, offset, seen = 14272, 8000, 0, 0
+        while offset < total_len:
+            window, end, _ = self._window(total_len, offset, size)
+            seen += len(window)
+            offset = end
+        assert seen == total_len, "windowing dropped or duplicated characters"
+
+    def test_offset_past_end_yields_nothing(self):
+        window, _, _ = self._window(100, 500, 8000)
+        assert window == ""
+
+    def test_short_body_needs_no_continuation(self):
+        _, end, total = self._window(120, 0, 8000)
+        assert end == total
+
+
+class TestQuoteImap:
+    """Query escaping. Observed live: a model-written query returned
+    `BAD Could not parse command` because an unescaped quote ended the string early."""
+
+    def test_plain_query(self):
+        assert gmail._quote_imap("from:stripe newer_than:7d") == '"from:stripe newer_than:7d"'
+
+    def test_embedded_quote_is_escaped(self):
+        assert gmail._quote_imap('subject:"trip docs"') == '"subject:\\"trip docs\\""'
+
+    def test_backslash_is_escaped_first(self):
+        assert gmail._quote_imap("a\\b") == '"a\\\\b"'
+
+    def test_result_is_balanced(self):
+        for q in ['a"b', "a\\b", 'a\\"b', "plain", ""]:
+            out = gmail._quote_imap(q)
+            assert out.startswith('"')
+            assert out.endswith('"')
+
+    def test_empty_query(self):
+        assert gmail._quote_imap("") == '""'
+
+
+class TestNonAsciiDetection:
+    """imaplib encodes the command line as ASCII, so CJK queries must take the literal path.
+    The first Chinese search raised UnicodeEncodeError before reaching Gmail."""
+
+    @pytest.mark.parametrize("q", ["hotel", "from:stripe", "newer_than:7d", ""])
+    def test_ascii_queries_take_the_inline_path(self, q: str):
+        assert q.isascii()
+
+    @pytest.mark.parametrize("q", ["日本 机票", "ホテル", "東京 予約", "日本"])
+    def test_cjk_queries_take_the_literal_path(self, q: str):
+        assert not q.isascii()
+
+    def test_utf8_encoding_round_trips(self):
+        q = "河口湖 予約"
+        assert q.encode("utf-8").decode("utf-8") == q
+
+
 class TestDecodeHeader:
     def test_plain_header(self):
         assert gmail._decode_header("Hello World") == "Hello World"

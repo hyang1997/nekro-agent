@@ -114,8 +114,9 @@ class GmailConfig(ConfigBase):
         ).model_dump(),
     )
     BODY_CHARS: int = Field(
-        default=4000,
-        title="正文最多返回字符",
+        default=8000,
+        title="单次返回的正文字符数",
+        description="一次读取返回的正文窗口大小；超出部分用 read_gmail(uid, offset=...) 续读",
         json_schema_extra=ExtraField(
             overridable=True,
             i18n_title=i18n.i18n_text(zh_CN="正文最多返回字符", en_US="Max Body Characters"),
@@ -271,6 +272,34 @@ def _as_text(data) -> str:
     return str(data)
 
 
+def _quote_imap(value: str) -> str:
+    """Wrap a query as an IMAP quoted string, escaping what the grammar reserves.
+
+    An unescaped `"` inside the query terminates the string early and the server answers
+    `BAD Could not parse command` — observed live on a query the model wrote.
+    """
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+async def _raw_search(client: ImapSmtpPasswordClient, query: str):
+    """Run an X-GM-RAW search, handling non-ASCII queries.
+
+    imaplib encodes the command line as ASCII, so a Chinese or Japanese search term raises
+    UnicodeEncodeError before anything reaches Gmail — which is exactly what happened the
+    first time the model searched in Chinese. Non-ASCII goes out as a UTF-8 literal with an
+    explicit CHARSET instead.
+    """
+    if query.isascii():
+        return await client.uid_command("SEARCH", "X-GM-RAW", _quote_imap(query))
+    return await client.uid_command(
+        "SEARCH",
+        "CHARSET",
+        "UTF-8",
+        "X-GM-RAW",
+        literal=query.encode("utf-8"),
+    )
+
+
 # --------------------------------------------------------------------------- prompt
 
 
@@ -283,7 +312,12 @@ async def inject_query_syntax(_ctx: AgentCtx) -> str:
         "filename:pdf larger:5M, quoted phrases, OR, and - to exclude. Combine them freely, e.g. "
         "`from:stripe newer_than:30d has:attachment` or `is:unread -category:promotions newer_than:2d`. "
         "Prefer a narrow query over a broad one: the mailbox is large and only the first "
-        f"{config.MAX_RESULTS} results come back, newest first."
+        f"{config.MAX_RESULTS} results come back, newest first.\n"
+        "These tools READ mail into your context and nothing else. There is no way to forward, "
+        "attach, or deliver an email through them, so never offer to send one — if the user wants "
+        "the message itself, say plainly that you can only quote it here.\n"
+        "Report what you actually found. A search that matches nothing means the mail is not there; "
+        "say so, and do not conclude the content must be inside some other message."
     )
 
 
@@ -315,13 +349,21 @@ async def search_gmail(_ctx: AgentCtx, query: str, limit: int = 0) -> str:
     cap = limit if limit and limit > 0 else config.MAX_RESULTS
 
     async def run(client: ImapSmtpPasswordClient, account: EmailAccount) -> str:
-        status, data = await client.uid_command("SEARCH", "X-GM-RAW", f'"{query}"')
+        status, data = await _raw_search(client, query)
         if status != "OK":
             return f"[Gmail] Search failed (status={status}) for query: {query}"
 
         uids = (data[0] or b"").split() if data else []
         if not uids:
-            return f"[Gmail] {account.USERNAME} has no messages matching `{query}`."
+            # A clean negative is a result, not a gap to fill. This wording exists because the
+            # model once ran three empty hotel searches and then told Hao the hotel receipt was
+            # inside a flight confirmation it had already read.
+            return (
+                f"[Gmail] {account.USERNAME} has no messages matching `{query}`. "
+                f"This is a definitive answer from Gmail, not a failure: no such mail is in the "
+                f"mailbox. Report that nothing was found. Do NOT conclude the content exists "
+                f"inside some other message, and do not describe anything you have not read."
+            )
 
         total = len(uids)
         # UIDs ascend roughly with time, so take the tail and reverse for newest-first
@@ -373,23 +415,29 @@ async def search_gmail(_ctx: AgentCtx, query: str, limit: int = 0) -> str:
 @plugin.mount_sandbox_method(
     SandboxMethodType.AGENT,
     name="读取邮件",
-    description="按 uid 读取一封邮件的完整正文（不会标记为已读）",
+    description="按 uid 读取邮件正文，可用 offset 续读长邮件（不会标记为已读）",
 )
-async def read_gmail(_ctx: AgentCtx, uid: str) -> str:
-    """Read one message in full by its uid.
+async def read_gmail(_ctx: AgentCtx, uid: str, offset: int = 0) -> str:
+    """Read one message by uid, optionally continuing from an offset.
 
     Args:
         uid: The uid shown by search_gmail.
+        offset: Character offset into the body; use the value the truncation notice gives you.
 
     Returns:
-        Headers plus the plain-text body, truncated to the configured length.
+        Headers plus a window of the plain-text body, with the exact call to continue.
 
     Example:
         read_gmail("48213")
+        read_gmail("48213", offset=8000)
     """
     uid = str(uid or "").strip()
     if not uid.isdigit():
         return f"[Gmail] Invalid uid {uid!r}. Use a uid returned by search_gmail."
+    try:
+        offset = max(int(offset), 0)
+    except (TypeError, ValueError):
+        offset = 0
 
     async def run(client: ImapSmtpPasswordClient, account: EmailAccount) -> str:
         status, data = await client.uid_command("FETCH", uid, "(BODY.PEEK[])")
@@ -424,10 +472,27 @@ async def read_gmail(_ctx: AgentCtx, uid: str) -> str:
             head.append("(No readable text body — this message may be image-only or attachment-only.)")
             return "\n".join(head)
 
-        if len(body) > config.BODY_CHARS:
-            hidden = len(body) - config.BODY_CHARS
-            body = body[: config.BODY_CHARS] + f"\n\n...(body truncated, {hidden} characters omitted)"
-        head.append(body)
+        total = len(body)
+        if offset >= total:
+            head.append(f"(offset {offset} is past the end of this body, which is {total} characters.)")
+            return "\n".join(head)
+
+        window = body[offset : offset + config.BODY_CHARS]
+        end = offset + len(window)
+        head.append(f"Body characters {offset}-{end} of {total}")
+        head.append("")
+        head.append(window)
+
+        if end < total:
+            # Naming the exact next call matters. A notice that only says "there is more" gives the
+            # model a labelled hole and no way to fill it, which is how a flight-only confirmation
+            # got reported as containing a hotel receipt.
+            head.append("")
+            head.append(
+                f"...({total - end} characters not shown. To read the next part, call "
+                f'read_gmail("{uid}", offset={end}) and stop there. Do NOT guess what the unread '
+                f"part contains — if it matters, read it.)",
+            )
         head.append("")
         head.append("(This read did not mark the message as read.)")
         return "\n".join(head)

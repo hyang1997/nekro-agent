@@ -10,6 +10,7 @@ from contextlib import suppress
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 import aiofiles
@@ -115,14 +116,20 @@ class ImapSmtpPasswordClient:
         conn = self._require_conn()
         return await asyncio.to_thread(self._get_mailbox_folders_sync, conn)
 
-    async def uid_command(self, command: str, *args: str) -> tuple[str, list]:
+    async def uid_command(self, command: str, *args: str, literal: Optional[bytes] = None) -> tuple[str, list]:
         """执行任意 IMAP UID 命令
 
         为插件保留的通用出口：服务商自有扩展（如 Gmail 的 X-GM-RAW / X-GM-LABELS /
         X-GM-THRID）无法用固定方法穷举，而绕过这里就只能去够 `_require_conn()`。
         读取类调用请使用 BODY.PEEK 而非 BODY，后者会把邮件标记为已读。
+
+        `literal` 用于非 ASCII 参数：imaplib 默认按 ASCII 编码命令行，中日文搜索词会直接
+        抛 UnicodeEncodeError。按 IMAP 的字面量语法把它单独发出去，配合 `CHARSET UTF-8`
+        才能搜到中日文邮件。
         """
         conn = self._require_conn()
+        if literal is not None:
+            conn.literal = literal
         return await asyncio.to_thread(conn.uid, command, *args)
 
     async def list_message_ids(self, unseen_only: bool) -> list[bytes]:
