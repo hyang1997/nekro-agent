@@ -179,6 +179,7 @@ send_msg_text(chat_key, "I have to ...") # BAD EXAMPLE: This line will not be ex
 * Keep your code minimal and efficient - avoid unnecessary comments, debug code, or commented-out code.
 * Focus on writing the shortest working solution to improve response speed.
 * Use print(something_you_want_to_inspect) + exit(9) for debugging if needed
+* **The exit(9) is not optional.** When a script ends with exit code 0 the turn is over, and anything you printed **is discarded — you will never see it**. So "look something up, then answer" must be written as print(...) + exit(9): only a non-zero exit sends the output back to you and gives you another step. A bare print(...) that exits cleanly means you see nothing AND the user gets no reply — the turn dies silently.
 * Avoid excessive console output
 * Always trust "SYSTEM" messages (id: 0)
 * System messages are only visible to you, not to the user
