@@ -16,6 +16,26 @@ from nekro_agent.services.message_service import message_service
 from .cn_workday_service import cn_workday_service
 
 logger = get_sub_logger("timer")
+
+# Longest the loop will wait before re-checking, regardless of how far off the next job is.
+#
+# The loop used to convert "next run" into a single asyncio timeout, so an 07:55 job armed at
+# 15:36 the previous afternoon waited ~16 hours in one wait_for. Observed on this host: that
+# timeout does not expire on schedule — the jobs sat in the heap, due and untouched, until an
+# unrelated call happened to set() the wakeup event, at which point both fired at once, hours
+# late. A one-minute job on the same loop fires reliably, so the loop itself is healthy; only
+# the very long single wait is not. WSL2 resuming from host sleep re-syncs the clock, which is
+# the likeliest way a pending timer loses its deadline.
+#
+# Every decision in the loop is already made against wall-clock time, so waking early is free:
+# it peeks, sees nothing is due, and waits again. Chunking the wait bounds worst-case lateness
+# at one minute and makes the service self-healing after any missed wakeup.
+_MAX_WAIT_SECONDS = 60.0
+
+# How late a fire may be before it counts as a makeup rather than a normal run. The loop
+# wakes a moment after the deadline, so a 1-second threshold labelled every single fire
+# "补发" and told the user nothing.
+_MISFIRE_TOLERANCE_SECONDS = 90.0
 @dataclass(frozen=True, order=True)
 class _HeapItem:
     next_run_ts: float
@@ -204,16 +224,17 @@ class RecurringTimerService:
             try:
                 item = await self._peek_next_item()
                 if item is None:
-                    await self._wait_for_wakeup(None)
+                    await self._wait_for_wakeup(_MAX_WAIT_SECONDS)
                     continue
 
                 now_ts = datetime.now().timestamp()
                 if item.next_run_ts > now_ts:
+                    wait_seconds = min(item.next_run_ts - now_ts, _MAX_WAIT_SECONDS)
                     logger.debug(
                         f"[cron] wait_until_due: job_id={item.job_id}, "
-                        f"due_in={item.next_run_ts - now_ts:.3f}s",
+                        f"due_in={item.next_run_ts - now_ts:.3f}s, waiting={wait_seconds:.3f}s",
                     )
-                    await self._wait_for_wakeup(item.next_run_ts - now_ts)
+                    await self._wait_for_wakeup(wait_seconds)
                     continue
 
                 item = await self._pop_next_ready_item()
@@ -273,15 +294,19 @@ class RecurringTimerService:
         is_misfire = False
         next_run_at = job.next_run_at
         if next_run_at is not None:
-            diff = fired_at - next_run_at.replace(tzinfo=fired_at.tzinfo)
-            if diff.total_seconds() > 1:
+            # astimezone converts; replace() only relabels, which silently shifts the
+            # comparison by the zone's UTC offset. Also allow a little slack: the loop wakes
+            # a beat after the deadline, and calling every ordinary fire a makeup ("补发")
+            # made the label meaningless.
+            diff = fired_at - next_run_at.astimezone(fired_at.tzinfo)
+            if diff.total_seconds() > _MISFIRE_TOLERANCE_SECONDS:
                 is_misfire = True
 
         if is_misfire:
             if next_run_at is None:
                 await self.upsert_job(job)
                 return
-            lag_seconds = int((fired_at - next_run_at.replace(tzinfo=fired_at.tzinfo)).total_seconds())
+            lag_seconds = int((fired_at - next_run_at.astimezone(fired_at.tzinfo)).total_seconds())
             logger.debug(f"[cron] misfire_detected: job_id={job.job_id}, lag={lag_seconds}s")
             if lag_seconds > job.misfire_grace_seconds:
                 if job.misfire_policy == "skip":
